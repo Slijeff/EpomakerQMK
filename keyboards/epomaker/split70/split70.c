@@ -140,6 +140,10 @@ static bool     strip_app_mode;
 static uint8_t  strip_rgb[STRIP_LED_COUNT][3];
 static uint32_t strip_last_frame;
 static bool     strip_sync_dirty;
+// Separate from strip_sync_dirty: the fallback colour and boot-app default
+// change rarely (via `default`/`boot`/`save`), so they ride a lighter 0xEF
+// command instead of riding along on every frame update.
+static bool     strip_cfg_dirty;
 
 static void strip_fill_fallback(void) {
     RGB rgb = hsv_to_rgb((HSV){.h = strip_cfg.h, .s = strip_cfg.s, .v = strip_cfg.v});
@@ -166,7 +170,13 @@ static void strip_cfg_load(void) {
     strip_app_mode   = strip_cfg.boot_app ? true : false;
     strip_last_frame = timer_read32();
     strip_fill_fallback();
+    // The slave's own EEPROM copy is never written -- id_custom_save only
+    // ever reaches the master, since raw HID only reaches whichever half is
+    // plugged in. Push both dirty flags so the slave's runtime state is
+    // overwritten with the master's true persisted config shortly after boot,
+    // rather than running on its own stale/default copy indefinitely.
     strip_sync_dirty = true;
+    strip_cfg_dirty  = true;
 }
 
 static void strip_cfg_save(void) {
@@ -253,18 +263,26 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
                     break;
                 }
                 case id_strip_default: {
-                    strip_cfg.h = value_data[0];
-                    strip_cfg.s = value_data[1];
-                    strip_cfg.v = value_data[2];
+                    strip_cfg.h     = value_data[0];
+                    strip_cfg.s     = value_data[1];
+                    strip_cfg.v     = value_data[2];
+                    strip_cfg_dirty = true;
                     break;
                 }
                 case id_strip_watchdog: {
                     strip_cfg.watchdog_ms = (uint16_t)((value_data[0] << 8) | value_data[1]);
                     strip_last_frame      = timer_read32();
+                    // Rides the existing 0xEE frame sync rather than 0xEF:
+                    // the slave enforces its own watchdog independently (it
+                    // never sees the host), so a value that only lives on the
+                    // master leaves the two halves reverting on different
+                    // schedules.
+                    strip_sync_dirty      = true;
                     break;
                 }
                 case id_strip_boot: {
                     strip_cfg.boot_app = value_data[0] ? 1 : 0;
+                    strip_cfg_dirty    = true;
                     break;
                 }
                 default: {
@@ -346,23 +364,45 @@ void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
 // PUT_RGB_MATRIX split transaction only carries rgb_config_t -- it will not
 // carry this custom state. Push it over the existing user RPC instead.
 static void strip_sync_push(void) {
-    if (!strip_sync_dirty || !is_keyboard_master()) return;
+    if (!is_keyboard_master()) return;
 
-    master_to_slave_t m2s = {0};
-    slave_to_master_t s2m = {0};
+    if (strip_sync_dirty) {
+        master_to_slave_t m2s = {0};
+        slave_to_master_t s2m = {0};
 
-    m2s.cmd     = 0xEE;
-    m2s.body[0] = strip_app_mode ? 1 : 0;
-    for (uint8_t i = 0; i < (STRIP_LED_COUNT - STRIP_RIGHT_FIRST); i++) {
-        m2s.body[1 + (i * 3) + 0] = strip_rgb[STRIP_RIGHT_FIRST + i][0];
-        m2s.body[1 + (i * 3) + 1] = strip_rgb[STRIP_RIGHT_FIRST + i][1];
-        m2s.body[1 + (i * 3) + 2] = strip_rgb[STRIP_RIGHT_FIRST + i][2];
+        m2s.cmd     = 0xEE;
+        m2s.body[0] = strip_app_mode ? 1 : 0;
+        for (uint8_t i = 0; i < (STRIP_LED_COUNT - STRIP_RIGHT_FIRST); i++) {
+            m2s.body[1 + (i * 3) + 0] = strip_rgb[STRIP_RIGHT_FIRST + i][0];
+            m2s.body[1 + (i * 3) + 1] = strip_rgb[STRIP_RIGHT_FIRST + i][1];
+            m2s.body[1 + (i * 3) + 2] = strip_rgb[STRIP_RIGHT_FIRST + i][2];
+        }
+        // The slave enforces its own watchdog independently -- it never sees
+        // the host directly -- so its copy of the timeout has to ride along
+        // here, or it reverts on a different schedule than the master.
+        m2s.body[10] = (uint8_t)(strip_cfg.watchdog_ms >> 8);
+        m2s.body[11] = (uint8_t)(strip_cfg.watchdog_ms & 0xFF);
+
+        // Retry on the next pass if the split bus was busy, otherwise a
+        // dropped frame would leave the two halves showing different colours.
+        if (transaction_rpc_exec(USER_SYNC_MMS, sizeof(m2s), &m2s, sizeof(s2m), &s2m)) {
+            strip_sync_dirty = false;
+        }
     }
 
-    // Retry on the next pass if the split bus was busy, otherwise a dropped
-    // frame would leave the two halves showing different colours.
-    if (transaction_rpc_exec(USER_SYNC_MMS, sizeof(m2s), &m2s, sizeof(s2m), &s2m)) {
-        strip_sync_dirty = false;
+    if (strip_cfg_dirty) {
+        master_to_slave_t m2s = {0};
+        slave_to_master_t s2m = {0};
+
+        m2s.cmd     = 0xEF;
+        m2s.body[0] = strip_cfg.h;
+        m2s.body[1] = strip_cfg.s;
+        m2s.body[2] = strip_cfg.v;
+        m2s.body[3] = strip_cfg.boot_app;
+
+        if (transaction_rpc_exec(USER_SYNC_MMS, sizeof(m2s), &m2s, sizeof(s2m), &s2m)) {
+            strip_cfg_dirty = false;
+        }
     }
 }
 
@@ -1960,10 +2000,22 @@ void user_sync_mms_slave_handler(uint8_t in_buflen, const void* in_data, uint8_t
                 strip_rgb[STRIP_RIGHT_FIRST + i][1] = m2s->body[1 + (i * 3) + 1];
                 strip_rgb[STRIP_RIGHT_FIRST + i][2] = m2s->body[1 + (i * 3) + 2];
             }
+            // Keep the slave's own watchdog check (see strip_app_active())
+            // in agreement with whatever the host set on the master -- it
+            // never sees the host directly, so without this it reverts on
+            // its own independent default schedule.
+            strip_cfg.watchdog_ms = (uint16_t)((m2s->body[10] << 8) | m2s->body[11]);
             // The slave never sees the host, so keep its watchdog fed from the
             // arrival of sync traffic instead.
             strip_last_frame = timer_read32();
             s2m->resp        = 0x00;
+            break;
+        case 0xEF: // strip config: fallback colour + boot-on-power default
+            strip_cfg.h        = m2s->body[0];
+            strip_cfg.s        = m2s->body[1];
+            strip_cfg.v        = m2s->body[2];
+            strip_cfg.boot_app = m2s->body[3];
+            s2m->resp          = 0x00;
             break;
         default :break;
     }
