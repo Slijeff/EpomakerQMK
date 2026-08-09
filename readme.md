@@ -8,6 +8,19 @@
 
 This is a keyboard firmware based on the [tmk_keyboard firmware](https://github.com/tmk/tmk_keyboard) with some useful features for Atmel AVR and ARM controllers, and more specifically, the [OLKB product line](https://olkb.com), the [ErgoDox EZ](https://ergodox-ez.com) keyboard, and the Clueboard product line.
 
+## 🔧 Personal fork remarks
+
+**This tree is my personal fork of [carlosedp/qmk_firmware](https://github.com/carlosedp/qmk_firmware). Beyond the upstream fork remarks below, `keyboards/epomaker/split70/` has been customized for my own daily-driver Split70 and no longer matches the stock Epomaker behaviour.**
+
+Split 70 changes at a glance:
+
+- A custom `STRIP_STATIC` RGB Matrix effect that lights only the six accent-strip LEDs and blanks the key LEDs.
+- All stock RGB Matrix animations disabled; `custom_strip_static` is the default animation, so `Fn + Tab` toggles between full-keyboard `SOLID_COLOR` and strip-only lighting.
+- `RM_NEXT` mode cycling rewritten to stop relying on hardcoded effect indices (fixes needing two `Fn + Tab` presses) and to skip the record/playback-only `RGBR_PLAY` mode.
+- Low-power sleep blocked on *both* halves while running over USB, so the right half can't sleep itself into an unwakeable state.
+
+Full details, plus the DFU flashing procedure for each half, are in [keyboards/epomaker/split70/readme.md](/keyboards/epomaker/split70/readme.md). Other keyboards in this tree are unmodified from upstream.
+
 ## 🚨 Forked firmware remarks
 
 **This fork holds keyboards not officially supported by the official QMK tree and have been incorporated by myself from other sources and/or adjusted to compile. Not all keyboards here have been tested and work 100% as the original firmware. Always know what you are doing and have a backup plan in case it doesn't work (know how to but your keyboard in BOOTLOADER mode and have the official firmware to revert).**
