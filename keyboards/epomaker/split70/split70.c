@@ -89,13 +89,282 @@ void eeconfig_confinfo_update(uint32_t raw) {
 
 typedef struct _master_to_slave_t {
     uint8_t cmd;
-    uint8_t body[4];
+    // Widened from 4 to 12 so the strip frame sync (0xEE) can carry the right
+    // half's three RGB triplets plus a mode byte. Both halves run the same
+    // image, so the two ends of the RPC stay in agreement.
+    uint8_t body[12];
 } master_to_slave_t;
 
 typedef struct _slave_to_master_t {
     uint8_t resp;
     uint8_t body[4];
 } slave_to_master_t;
+
+/* ------------------------------------------------------------------------
+ * Companion-app control of the six accent strip LEDs.
+ *
+ * The strip LEDs are indices 0-2 (left half) and 36-38 (right half); they all
+ * map to matrix [0,0] in keyboard.json because they are not tied to any key.
+ *
+ * A host application drives them over raw HID using a VIA custom channel, so
+ * the same protocol works on USB, Bluetooth and 2.4G: md_raw.c bridges raw HID
+ * onto the wireless module, and via.c is compiled with
+ * -Draw_hid_send=replaced_hid_send (see linker/wireless/wireless.mk) so replies
+ * go out over whichever link is active.
+ *
+ * NOTE: that -D rename applies to via.o only. Never call raw_hid_send() from
+ * this file -- it is a silent no-op in wireless mode. Handling the request in
+ * via_custom_value_command_kb() and letting via.c send the reply avoids this.
+ * ---------------------------------------------------------------------- */
+
+#define STRIP_LED_COUNT 6
+#define STRIP_RIGHT_FIRST 3 // array index at which the right half's LEDs begin
+
+static const uint8_t strip_led_indices[STRIP_LED_COUNT] = {0, 1, 2, 36, 37, 38};
+
+#define STRIP_CFG_MAGIC 0x53
+
+typedef struct {
+    uint8_t  magic;       // STRIP_CFG_MAGIC once written
+    uint8_t  boot_app;    // take over the strip at power-on?
+    uint8_t  h;           // fallback colour, also the first frame on takeover
+    uint8_t  s;
+    uint8_t  v;
+    uint16_t watchdog_ms; // 0 disables
+    uint8_t  reserved;
+} strip_cfg_t;
+
+static strip_cfg_t strip_cfg;
+
+static bool     strip_app_mode;
+static uint8_t  strip_rgb[STRIP_LED_COUNT][3];
+static uint32_t strip_last_frame;
+static bool     strip_sync_dirty;
+
+static void strip_fill_fallback(void) {
+    RGB rgb = hsv_to_rgb((HSV){.h = strip_cfg.h, .s = strip_cfg.s, .v = strip_cfg.v});
+    for (uint8_t i = 0; i < STRIP_LED_COUNT; i++) {
+        strip_rgb[i][0] = rgb.r;
+        strip_rgb[i][1] = rgb.g;
+        strip_rgb[i][2] = rgb.b;
+    }
+}
+
+static void strip_cfg_load(void) {
+    eeconfig_read_user_datablock(&strip_cfg, (uint32_t)STRIP_EECONFIG_OFFSET, sizeof(strip_cfg));
+
+    if (strip_cfg.magic != STRIP_CFG_MAGIC) {
+        strip_cfg.magic       = STRIP_CFG_MAGIC;
+        strip_cfg.boot_app    = 0;
+        strip_cfg.h           = 0;
+        strip_cfg.s           = 0;
+        strip_cfg.v           = RGB_MATRIX_MAXIMUM_BRIGHTNESS;
+        strip_cfg.watchdog_ms = 3000;
+        strip_cfg.reserved    = 0;
+    }
+
+    strip_app_mode   = strip_cfg.boot_app ? true : false;
+    strip_last_frame = timer_read32();
+    strip_fill_fallback();
+    strip_sync_dirty = true;
+}
+
+static void strip_cfg_save(void) {
+    strip_cfg.magic = STRIP_CFG_MAGIC;
+    eeconfig_update_user_datablock(&strip_cfg, (uint32_t)STRIP_EECONFIG_OFFSET, sizeof(strip_cfg));
+}
+
+// True while the host is actively driving the strip. Once the watchdog expires
+// we hand the strip back to the normal rgb_matrix effect rather than freezing
+// on the last frame received.
+static bool strip_app_active(void) {
+    if (!strip_app_mode) return false;
+
+    if (strip_cfg.watchdog_ms && timer_elapsed32(strip_last_frame) > strip_cfg.watchdog_ms) {
+        strip_app_mode = false;
+        return false;
+    }
+
+    return true;
+}
+
+static void strip_render(uint8_t led_min, uint8_t led_max) {
+    if (!strip_app_active()) return;
+
+    for (uint8_t i = 0; i < STRIP_LED_COUNT; i++) {
+        uint8_t index = strip_led_indices[i];
+        if (index < led_min || index >= led_max) continue;
+        rgb_matrix_set_color(index, strip_rgb[i][0], strip_rgb[i][1], strip_rgb[i][2]);
+    }
+}
+
+#ifdef VIA_ENABLE
+#    include "via.h"
+
+// Channel id chosen well clear of the QMK core channels (1..5).
+#    define id_epomaker_strip_channel 0x10
+
+enum epomaker_strip_value_id {
+    id_strip_mode     = 0x01, // 1 byte : 0 = firmware effects, 1 = host driven
+    id_strip_frame    = 0x02, // 18 bytes: RGB x6, order {0,1,2,36,37,38}
+    id_strip_default  = 0x03, // 3 bytes : fallback HSV
+    id_strip_identify = 0x04, // get only
+    id_strip_watchdog = 0x05, // 2 bytes : timeout ms, big endian, 0 disables
+    id_strip_boot     = 0x06, // 1 byte  : enter host-driven mode at power-on
+};
+
+#    define STRIP_PROTOCOL_VERSION 1
+
+void via_custom_value_command_kb(uint8_t *data, uint8_t length) {
+    // data = [ command_id, channel_id, value_id, value_data... ]
+    uint8_t *command_id   = &(data[0]);
+    uint8_t *channel_id   = &(data[1]);
+    uint8_t *value_id     = &(data[2]);
+    uint8_t *value_data   = &(data[3]);
+
+    if (*channel_id != id_epomaker_strip_channel) {
+        *command_id = id_unhandled;
+        return;
+    }
+
+    switch (*command_id) {
+        case id_custom_set_value: {
+            switch (*value_id) {
+                case id_strip_mode: {
+                    bool enable = value_data[0] ? true : false;
+                    // Entering host control with no frame yet: show the
+                    // fallback colour rather than whatever was left over.
+                    if (enable && !strip_app_mode) strip_fill_fallback();
+                    strip_app_mode   = enable;
+                    strip_last_frame = timer_read32();
+                    strip_sync_dirty = true;
+                    break;
+                }
+                case id_strip_frame: {
+                    for (uint8_t i = 0; i < STRIP_LED_COUNT; i++) {
+                        strip_rgb[i][0] = value_data[(i * 3) + 0];
+                        strip_rgb[i][1] = value_data[(i * 3) + 1];
+                        strip_rgb[i][2] = value_data[(i * 3) + 2];
+                    }
+                    // A frame implies host control; this also feeds the watchdog.
+                    strip_app_mode   = true;
+                    strip_last_frame = timer_read32();
+                    strip_sync_dirty = true;
+                    break;
+                }
+                case id_strip_default: {
+                    strip_cfg.h = value_data[0];
+                    strip_cfg.s = value_data[1];
+                    strip_cfg.v = value_data[2];
+                    break;
+                }
+                case id_strip_watchdog: {
+                    strip_cfg.watchdog_ms = (uint16_t)((value_data[0] << 8) | value_data[1]);
+                    strip_last_frame      = timer_read32();
+                    break;
+                }
+                case id_strip_boot: {
+                    strip_cfg.boot_app = value_data[0] ? 1 : 0;
+                    break;
+                }
+                default: {
+                    *command_id = id_unhandled;
+                    break;
+                }
+            }
+            break;
+        }
+
+        case id_custom_get_value: {
+            switch (*value_id) {
+                case id_strip_mode: {
+                    value_data[0] = strip_app_active() ? 1 : 0;
+                    break;
+                }
+                case id_strip_frame: {
+                    for (uint8_t i = 0; i < STRIP_LED_COUNT; i++) {
+                        value_data[(i * 3) + 0] = strip_rgb[i][0];
+                        value_data[(i * 3) + 1] = strip_rgb[i][1];
+                        value_data[(i * 3) + 2] = strip_rgb[i][2];
+                    }
+                    break;
+                }
+                case id_strip_default: {
+                    value_data[0] = strip_cfg.h;
+                    value_data[1] = strip_cfg.s;
+                    value_data[2] = strip_cfg.v;
+                    break;
+                }
+                case id_strip_identify: {
+                    // Magic lets the host tell this firmware apart from any
+                    // other device exposing the VIA raw usage page.
+                    value_data[0] = 'E';
+                    value_data[1] = 'P';
+                    value_data[2] = 'S';
+                    value_data[3] = 'T';
+                    value_data[4] = STRIP_PROTOCOL_VERSION;
+                    value_data[5] = STRIP_LED_COUNT;
+#    ifdef WIRELESS_ENABLE
+                    // Current link, so the host can pick a sane frame rate.
+                    value_data[6] = wireless_get_current_devs();
+#    else
+                    value_data[6] = 0;
+#    endif
+                    break;
+                }
+                case id_strip_watchdog: {
+                    value_data[0] = (uint8_t)(strip_cfg.watchdog_ms >> 8);
+                    value_data[1] = (uint8_t)(strip_cfg.watchdog_ms & 0xFF);
+                    break;
+                }
+                case id_strip_boot: {
+                    value_data[0] = strip_cfg.boot_app;
+                    break;
+                }
+                default: {
+                    *command_id = id_unhandled;
+                    break;
+                }
+            }
+            break;
+        }
+
+        case id_custom_save: {
+            strip_cfg_save();
+            break;
+        }
+
+        default: {
+            *command_id = id_unhandled;
+            break;
+        }
+    }
+}
+#endif // VIA_ENABLE
+
+// The strip LEDs at indices 36-38 live on the right half, and the automatic
+// PUT_RGB_MATRIX split transaction only carries rgb_config_t -- it will not
+// carry this custom state. Push it over the existing user RPC instead.
+static void strip_sync_push(void) {
+    if (!strip_sync_dirty || !is_keyboard_master()) return;
+
+    master_to_slave_t m2s = {0};
+    slave_to_master_t s2m = {0};
+
+    m2s.cmd     = 0xEE;
+    m2s.body[0] = strip_app_mode ? 1 : 0;
+    for (uint8_t i = 0; i < (STRIP_LED_COUNT - STRIP_RIGHT_FIRST); i++) {
+        m2s.body[1 + (i * 3) + 0] = strip_rgb[STRIP_RIGHT_FIRST + i][0];
+        m2s.body[1 + (i * 3) + 1] = strip_rgb[STRIP_RIGHT_FIRST + i][1];
+        m2s.body[1 + (i * 3) + 2] = strip_rgb[STRIP_RIGHT_FIRST + i][2];
+    }
+
+    // Retry on the next pass if the split bus was busy, otherwise a dropped
+    // frame would leave the two halves showing different colours.
+    if (transaction_rpc_exec(USER_SYNC_MMS, sizeof(m2s), &m2s, sizeof(s2m), &s2m)) {
+        strip_sync_dirty = false;
+    }
+}
 
 uint32_t eeconfig_confinfo_read(void) {
     return eeconfig_read_kb();
@@ -160,6 +429,8 @@ void keyboard_post_init_kb(void) {
 #endif
 
     eeconfig_confinfo_init();
+
+    strip_cfg_load();
 
     // Only master controls LED_POWER_EN_PIN/EN2_PIN directly
     // Slave uses A5/A8 controlled via RPC commands
@@ -1200,6 +1471,10 @@ void housekeeping_task_kb(void) { // loop
     if (wireless_get_current_devs() == DEVS_USB && im_test_rate_flag) usb_mode_test_report_task();
         wireless_task();
 
+    // Runs outside the raw HID callback so a busy split bus cannot stall the
+    // host transfer.
+    strip_sync_push();
+
 #ifdef WIRELESS_ENABLE
     uint8_t         hs_now_mode;
     static uint32_t hs_current_time;
@@ -1562,6 +1837,10 @@ bool rgb_matrix_indicators_advanced_kb(uint8_t led_min, uint8_t led_max) {
     rgb_matrix_hs_indicator();
     if (confinfo.filp) rgb_matrix_set_color(32, RGB_MATRIX_MAXIMUM_BRIGHTNESS, RGB_MATRIX_MAXIMUM_BRIGHTNESS, RGB_MATRIX_MAXIMUM_BRIGHTNESS);
     query();
+    // Last, so host-driven strip colours win over the active effect. Running
+    // here rather than in a custom effect is what lets the strip be driven
+    // while the keys keep animating.
+    strip_render(led_min, led_max);
     return true;
 }
 
@@ -1673,6 +1952,18 @@ void user_sync_mms_slave_handler(uint8_t in_buflen, const void* in_data, uint8_t
         case 0xDD:
             hs_reset_settings();
             s2m->resp = 0x00;
+            break;
+        case 0xEE: // strip frame for this half's LEDs (indices 36-38)
+            strip_app_mode = m2s->body[0] ? true : false;
+            for (uint8_t i = 0; i < (STRIP_LED_COUNT - STRIP_RIGHT_FIRST); i++) {
+                strip_rgb[STRIP_RIGHT_FIRST + i][0] = m2s->body[1 + (i * 3) + 0];
+                strip_rgb[STRIP_RIGHT_FIRST + i][1] = m2s->body[1 + (i * 3) + 1];
+                strip_rgb[STRIP_RIGHT_FIRST + i][2] = m2s->body[1 + (i * 3) + 2];
+            }
+            // The slave never sees the host, so keep its watchdog fed from the
+            // arrival of sync traffic instead.
+            strip_last_frame = timer_read32();
+            s2m->resp        = 0x00;
             break;
         default :break;
     }

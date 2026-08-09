@@ -97,8 +97,14 @@
 /* rgb_record */
 #define ENABLE_RGB_MATRIX_RGBR_PLAY
 #define RGBREC_CHANNEL_NUM         4
+// confinfo block: 4 bytes for confinfo.raw, then 16 bytes of per-mode hsv index
+// (one byte per entry of rgb_record.c's rgbmatrix_buff[], which has 16 entries --
+// so all 16 are in use, see record_color_hsv()).
 #define EECONFIG_CONFINFO_USE_SIZE (4 + 16)
+#define EECONFIG_STRIP_USE_SIZE    8
 #define EECONFIG_RGBREC_USE_SIZE   (RGBREC_CHANNEL_NUM * MATRIX_ROWS * MATRIX_COLS * 2)
-#define EECONFIG_USER_DATA_SIZE    (EECONFIG_RGBREC_USE_SIZE + EECONFIG_CONFINFO_USE_SIZE)
+#define EECONFIG_USER_DATA_SIZE    (EECONFIG_RGBREC_USE_SIZE + EECONFIG_CONFINFO_USE_SIZE + EECONFIG_STRIP_USE_SIZE)
 #define RGBREC_EECONFIG_OFFSET     0
 #define CONFINFO_EECONFIG_OFFSET   (RGBREC_EECONFIG_OFFSET + (uint32_t)EECONFIG_RGBREC_USE_SIZE)
+// Appended after the confinfo block so existing stored offsets are untouched.
+#define STRIP_EECONFIG_OFFSET      (CONFINFO_EECONFIG_OFFSET + (uint32_t)EECONFIG_CONFINFO_USE_SIZE)

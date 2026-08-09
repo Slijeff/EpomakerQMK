@@ -129,3 +129,5 @@ via*.json
 
 # Personal keymap
 /keyboards/**/keymaps/via*
+
+.claude/
