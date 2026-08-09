@@ -1137,14 +1137,20 @@ bool     process_record_kb(uint16_t keycode, keyrecord_t *record) {
 
         case RM_NEXT: {
             if (record->event.pressed) {
-                uint8_t mode = rgb_matrix_get_mode();
-                if (mode == 29) {
-                    rgb_matrix_mode(31);
-                    return false;
+                uint8_t mode = rgb_matrix_get_mode() + 1;
+                if (mode >= RGB_MATRIX_EFFECT_MAX) {
+                    mode = 1;
                 }
+                // RGBR_PLAY is only meant to be reached via the RGB record/playback
+                // feature, not the normal RM_NEXT cycle, so skip over it here.
+                if (mode == RGB_MATRIX_CUSTOM_RGBR_PLAY) {
+                    mode++;
+                    if (mode >= RGB_MATRIX_EFFECT_MAX) {
+                        mode = 1;
+                    }
+                }
+                rgb_matrix_mode(mode);
             }
-            return true;
-
             return false;
         } break;
         case KC_LCMD: {
