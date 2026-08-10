@@ -665,11 +665,6 @@ bool lpwr_is_allow_presleep_hook(void) {
         } else {
             dprint("Slave sync failed!\n");
         }
-
-        if (confinfo.devs != DEVS_USB) {
-            palSetLineMode(SERIAL_USART_RX_PIN, PAL_OUTPUT_TYPE_OPENDRAIN);
-            palSetLineMode(SERIAL_USART_TX_PIN, PAL_OUTPUT_TYPE_OPENDRAIN);
-        }
     }
 
     if ((wireless_get_current_devs() == DEVS_USB) && (!charging_state)) {
@@ -681,6 +676,19 @@ bool lpwr_is_allow_presleep_hook(void) {
         }
     }
     return true;
+}
+
+void lpwr_stop_hook_pre(void) {
+    // Deferred from lpwr_is_allow_presleep_hook()/the 0xAA RPC handler:
+    // switching these pins to open-drain before the 0xBB power-down RPC
+    // breaks that transaction (no external pull-up to drive a clean
+    // logic-high), which is why the slave/right half's LED rail never got
+    // powered down in wireless mode. Do it here instead, after
+    // suspend_power_down_user()'s 0xBB has already been sent/received.
+    if (confinfo.devs != DEVS_USB) {
+        palSetLineMode(SERIAL_USART_RX_PIN, PAL_OUTPUT_TYPE_OPENDRAIN);
+        palSetLineMode(SERIAL_USART_TX_PIN, PAL_OUTPUT_TYPE_OPENDRAIN);
+    }
 }
 
 void wireless_post_task(void) {
@@ -1976,10 +1984,8 @@ void user_sync_mms_slave_handler(uint8_t in_buflen, const void* in_data, uint8_t
             s2m->resp = 0x00;
         break;
         case 0xAA:
-            if (confinfo.devs != DEVS_USB) {
-                palSetLineMode(SERIAL_USART_RX_PIN, PAL_OUTPUT_TYPE_OPENDRAIN);
-                palSetLineMode(SERIAL_USART_TX_PIN, PAL_OUTPUT_TYPE_OPENDRAIN);
-            }
+            // Open-drain switch deferred to lpwr_stop_hook_pre() so it
+            // doesn't run before this half's own 0xBB power-down handling.
             s2m->resp = 0x00;
             lower_sleep = m2s->body[0];
             lpwr_set_timeout_manual(true);
