@@ -45,7 +45,10 @@ bool STRIP_STATIC(effect_params_t *params) {
 
     for (uint8_t i = led_min; i < led_max; i++) {
         if (strip_static_is_strip_led(i)) {
-            rgb_matrix_set_color(i, rgb.r, rgb.g, rgb.b);
+            // Strip LEDs are wired R/G-swapped relative to the rest of the
+            // matrix; see the matching compensation in split70.c's
+            // strip_render().
+            rgb_matrix_set_color(i, rgb.g, rgb.r, rgb.b);
         } else {
             rgb_matrix_set_color(i, 0, 0, 0);
         }

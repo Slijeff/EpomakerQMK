@@ -204,7 +204,13 @@ static void strip_render(uint8_t led_min, uint8_t led_max) {
     for (uint8_t i = 0; i < STRIP_LED_COUNT; i++) {
         uint8_t index = strip_led_indices[i];
         if (index < led_min || index >= led_max) continue;
-        rgb_matrix_set_color(index, strip_rgb[i][0], strip_rgb[i][1], strip_rgb[i][2]);
+        // The accent strip LEDs are wired R/G-swapped relative to the rest of
+        // the matrix (confirmed by dump-frame: the firmware stores the
+        // intended colour correctly, but the strip renders it with red and
+        // green interchanged) -- compensate here rather than in the wire
+        // protocol, so strip_rgb and GetFrame readback keep the colour the
+        // host actually asked for.
+        rgb_matrix_set_color(index, strip_rgb[i][1], strip_rgb[i][0], strip_rgb[i][2]);
     }
 }
 
